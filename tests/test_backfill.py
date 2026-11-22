@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.main import create_app  # noqa: E402
+from app import packages as packages_mod  # noqa: E402
 
 
 def build_zip(rows, pad_bytes: int = 0, name: str = "intake.csv") -> bytes:
@@ -52,6 +53,29 @@ def register(client, filename: str, content: bytes) -> dict:
 
 def stored_path(client, pkg_id: int) -> str:
     return os.path.join(client.data_dir, "packages", f"pkg_{pkg_id:06d}.zip")
+
+
+class FlakyVolume:
+    """模拟冷档卷：指定包本次读盘抛 EIO，其余正常。"""
+
+    def __init__(self, paths: dict[str, int]) -> None:
+        self.paths = paths
+
+    def __call__(self, path: str):
+        if path in self.paths:
+            raise OSError(5, "Input/output error")
+        return open(path, "rb")
+
+
+@pytest.fixture()
+def flaky_volume(monkeypatch):
+    volume = FlakyVolume({})
+    monkeypatch.setattr(packages_mod, "_open_binary", volume)
+    return volume
+
+
+def statuses(client) -> dict[int, str]:
+    return {p["id"]: p["status"] for p in client.get("/packages").json()}
 
 
 @pytest.fixture()
@@ -148,7 +172,171 @@ def test_missing_file_reselect(client, overlapping):
     assert pkgs[cheap_id]["status"] == "missing"
 
 
-# ---------- 无全覆盖 -> 整次退回，不用旧修订补齐 ----------
+# ---------- 读盘 I/O 错误：只影响本次，不记入目录 ----------
+
+def test_io_error_not_catalogued_and_retry_keeps_locked_revision(client, flaky_volume):
+    rev2 = register(client, "only_rev2.zip",
+                    build_zip([("2026-11-01", 2, 110.0),
+                               ("2026-11-02", 2, 120.0)]))
+    register(client, "old_rev1.zip",
+             build_zip([("2026-11-01", 1, 111.0),
+                        ("2026-11-02", 1, 121.0)]))
+    flaky_volume.paths[stored_path(client, rev2["id"])] = rev2["id"]
+
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-02"})
+    # 暂不可读的包按可用计才能补齐 -> 503 请调用方重试
+    assert r.status_code == 503, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "retry_required"
+    assert detail["reason"] == "recovery_required_for_coverage"
+    assert detail["retry_packages"] == [
+        {"package_id": rev2["id"], "name": "only_rev2.zip", "reason": "io_error"}
+    ]
+    # 读盘错误没有写入目录，后续请求仍可核验该包
+    assert statuses(client)[rev2["id"]] == "registered"
+
+    flaky_volume.paths.clear()  # 卷恢复
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-02"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [d["revision"] for d in body["days"]] == [2, 2]
+    assert {p["name"] for p in body["packages"]} == {"only_rev2.zip"}
+    assert body["retry_packages"] == []
+
+
+def test_io_error_with_equal_cost_alternate_still_delivers(client, flaky_volume):
+    # 两个同覆盖、同字节的包（内容相同）；其中一个暂不可读，
+    # 恢复后也不会更省 -> 照常交付，不改修订
+    rows = [("2026-11-01", 1, 100.0), ("2026-11-02", 1, 101.0)]
+    a = register(client, "a.zip", build_zip(rows))
+    b = register(client, "b.zip", build_zip(rows))
+    assert a["size_bytes"] == b["size_bytes"]
+    flaky_volume.paths[stored_path(client, a["id"])] = a["id"]
+
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-02"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert {p["name"] for p in body["packages"]} == {"b.zip"}
+    assert body["reselections"] == []
+    assert body["retry_packages"] == [
+        {"package_id": a["id"], "name": "a.zip", "reason": "io_error"}
+    ]
+    assert statuses(client)[a["id"]] == "registered"
+
+
+def test_io_error_plus_missing_503_then_recovery(client, overlapping, flaky_volume):
+    cheap_id = overlapping["cheap"]["id"]
+    fix_id = overlapping["fix"]["id"]
+    os.unlink(stored_path(client, cheap_id))            # 确实缺失 -> 记入目录
+    flaky_volume.paths[stored_path(client, fix_id)] = fix_id  # 读盘错误 -> 只影响本次
+
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-11"})
+    assert r.status_code == 503, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "recovery_required_for_coverage"
+    assert [p["package_id"] for p in detail["retry_packages"]] == [fix_id]
+    assert detail["excluded_packages"] == [
+        {"package_id": cheap_id, "name": "cheap_rev1.zip", "reason": "missing"}
+    ]
+    st = statuses(client)
+    assert st[cheap_id] == "missing"
+    assert st[fix_id] == "registered"
+
+    flaky_volume.paths.clear()  # 卷恢复
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-11"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert {p["name"] for p in body["packages"]} == {
+        "week1_rev1.zip", "week2_rev1.zip", "fix_rev2.zip"}
+    by_date = {d["date"]: d for d in body["days"]}
+    assert by_date["2026-11-06"]["revision"] == 2  # 锁定修订未回落到 rev1
+    assert by_date["2026-11-06"]["feed_kg"] == 215.5
+
+
+def test_io_error_on_cheaper_package_retries_for_bytes(client, overlapping, flaky_volume):
+    cheap_id = overlapping["cheap"]["id"]
+    flaky_volume.paths[stored_path(client, cheap_id)] = cheap_id
+
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-11"})
+    assert r.status_code == 503, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "recovery_reduces_bytes"
+    assert detail["recovered_total_bytes"] < detail["delivered_total_bytes"]
+    assert [p["package_id"] for p in detail["retry_packages"]] == [cheap_id]
+    assert statuses(client)[cheap_id] == "registered"
+
+    flaky_volume.paths.clear()
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-11"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert {p["name"] for p in body["packages"]} == {
+        "cheap_rev1.zip", "week2_rev1.zip", "fix_rev2.zip"}
+    assert body["total_bytes"] == sum(p["size_bytes"] for p in body["packages"])
+
+
+def test_checksum_still_catalogued_alongside_io_error(client):
+    # 只有 rev1 的包（可读）+ 唯一持 rev2 的包（SHA-256 不符）；11-06/07 的
+    # 最高修订只存在于损坏包中 -> 409；随后卷恢复也补不齐
+    rev1 = register(client, "rev1.zip",
+                    build_zip([("2026-11-01", 1, 100.0), ("2026-11-02", 1, 101.0)]))
+    rev2 = register(client, "rev2.zip",
+                    build_zip([("2026-11-01", 2, 110.0), ("2026-11-02", 2, 120.0)]))
+    with open(stored_path(client, rev2["id"]), "wb") as f:
+        f.write(b"tampered-bytes")                      # SHA-256 不符 -> 记入目录
+
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-02"})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["error"] == "no_full_coverage"
+    assert detail["uncoverable_days"] == ["2026-11-01", "2026-11-02"]
+    assert detail["excluded_packages"] == [
+        {"package_id": rev2["id"], "name": "rev2.zip", "reason": "checksum_mismatch"}
+    ]
+    assert detail["unreadable_packages"] == []
+    st = statuses(client)
+    assert st[rev2["id"]] == "corrupt"
+    assert st[rev1["id"]] == "registered"
+
+    # 后续请求按目录重新确定修订（损坏包已按原规则出目录）：只剩 rev1，
+    # 因此正常交付 rev1，而不会把 rev2 记成"缺失"后又在同一请求内回落。
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-02"})
+    assert r.status_code == 200, r.text
+    assert [d["revision"] for d in r.json()["days"]] == [1, 1]
+
+
+def test_unmounted_volume_is_io_error_not_missing(client):
+    """整个卷掉挂载：包目录消失、open 抛 FileNotFoundError -> 读盘错误，不落库。"""
+    rev2 = register(client, "only_rev2.zip",
+                    build_zip([("2026-11-01", 2, 110.0),
+                               ("2026-11-02", 2, 120.0)]))
+    register(client, "old_rev1.zip",
+             build_zip([("2026-11-01", 1, 111.0),
+                        ("2026-11-02", 1, 121.0)]))
+    pkg_dir = os.path.join(client.data_dir, "packages")
+    backup = os.path.join(client.data_dir, "packages_offline")
+    os.rename(pkg_dir, backup)  # 模拟挂载点整体消失
+
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-02"})
+    assert r.status_code == 503, r.text
+    assert r.json()["detail"]["excluded_packages"] == []
+    assert statuses(client)[rev2["id"]] == "registered"
+
+    os.rename(backup, pkg_dir)  # 卷恢复
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-02"})
+    assert r.status_code == 200, r.text
+    assert [d["revision"] for d in r.json()["days"]] == [2, 2]
+
 
 def test_no_coverage_rejects_without_downgrade(client):
     only = register(client, "only_rev2.zip",
@@ -167,6 +355,73 @@ def test_no_coverage_rejects_without_downgrade(client):
     assert detail["uncoverable_days"] == ["2026-11-01", "2026-11-02"]
     assert detail["excluded_packages"][0]["reason"] == "missing"
     # 没有拿修订 1 的旧值补齐：整个请求被退回，无 days 结果
+
+
+def test_volume_recovery_with_missing_and_io_error(client, overlapping, flaky_volume):
+    """卷恢复 + 坏包（确实缺失）+ 读盘错误同时出现。"""
+    cheap_id = overlapping["cheap"]["id"]
+    fix_id = overlapping["fix"]["id"]
+    os.unlink(stored_path(client, cheap_id))                   # 确实缺失 -> 落库
+    flaky_volume.paths[stored_path(client, fix_id)] = fix_id   # 读盘错误 -> 不落库
+
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-11"})
+    # cheap 缺失、fix 暂不可读；缺 fix 则 11-06/07 的 rev2 无法补齐 -> 503
+    assert r.status_code == 503, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "recovery_required_for_coverage"
+    assert [p["package_id"] for p in detail["retry_packages"]] == [fix_id]
+    assert detail["excluded_packages"] == [
+        {"package_id": cheap_id, "name": "cheap_rev1.zip", "reason": "missing"}
+    ]
+    st = statuses(client)
+    assert st[cheap_id] == "missing"
+    assert st[fix_id] == "registered"
+
+    flaky_volume.paths.clear()  # 卷恢复
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-11"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert {p["name"] for p in body["packages"]} == {
+        "week1_rev1.zip", "week2_rev1.zip", "fix_rev2.zip"}
+    by_date = {d["date"]: d for d in body["days"]}
+    assert by_date["2026-11-06"]["revision"] == 2      # 锁定修订未回落
+    assert by_date["2026-11-06"]["feed_kg"] == 215.5
+    assert body["reselections"] == []
+    assert body["retry_packages"] == []
+
+
+def test_corrupt_plus_io_error_409_then_recovery(client, overlapping, flaky_volume):
+    """坏包（SHA-256 不符）+ 读盘错误；恢复后坏包仍不可用。"""
+    fix_id = overlapping["fix"]["id"]
+    cheap_id = overlapping["cheap"]["id"]
+    with open(stored_path(client, fix_id), "wb") as f:
+        f.write(b"tampered-bytes")                             # 落库 corrupt
+    flaky_volume.paths[stored_path(client, cheap_id)] = cheap_id  # 不落库
+
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-11"})
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["uncoverable_days"] == ["2026-11-06", "2026-11-07"]
+    assert detail["excluded_packages"] == [
+        {"package_id": fix_id, "name": "fix_rev2.zip", "reason": "checksum_mismatch"}
+    ]
+    assert detail["unreadable_packages"] == [
+        {"package_id": cheap_id, "name": "cheap_rev1.zip", "reason": "io_error"}
+    ]
+    st = statuses(client)
+    assert st[fix_id] == "corrupt"
+    assert st[cheap_id] == "registered"
+
+    flaky_volume.paths.clear()  # 卷恢复：cheap 可读，但 fix 确实损坏不复活
+    r = client.post("/backfill", json={"start_date": "2026-11-01",
+                                       "end_date": "2026-11-11"})
+    # 损坏包已按原规则出目录，目录里只剩 rev1 -> 后续请求正常交付 rev1
+    assert r.status_code == 200, r.text
+    assert {d["revision"] for d in r.json()["days"]} == {1}
+    assert statuses(client)[fix_id] == "corrupt"
 
 
 # ---------- 缺日 / 异值 / 区间限制 ----------

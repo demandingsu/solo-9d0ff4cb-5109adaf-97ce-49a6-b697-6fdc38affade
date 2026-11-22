@@ -12,6 +12,7 @@ import csv
 import hashlib
 import io
 import math
+import os
 import zipfile
 from datetime import date as date_type
 from typing import NamedTuple
@@ -104,20 +105,32 @@ def parse_package(buf: bytes) -> list[DayRow]:
     ]
 
 
+def _open_binary(path: str):
+    """打开待校验的冷档；单独成函数便于测试注入读盘故障。"""
+    return open(path, "rb")
+
+
 def verify_package_file(path: str, expected_sha256: str) -> tuple[bool, str | None]:
     """调取前校验整包：文件存在且 SHA-256 与登记值一致。
 
-    返回 (是否通过, 失败原因)。reason ∈ {"missing", "checksum_mismatch"}。
+    返回 (是否通过, 失败原因)。reason ∈ {"missing", "checksum_mismatch", "io_error"}。
+    - missing:           文件确实不存在（包目录仍在）
+    - checksum_mismatch: 文件内容与登记 SHA-256 不符
+    - io_error:          读盘失败（卷暂不可用、EIO、权限等），只影响本次请求，
+                         不得记入目录
     """
     try:
         h = hashlib.sha256()
-        with open(path, "rb") as f:
+        with _open_binary(path) as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
     except FileNotFoundError:
+        # 卷整体掉挂载时目录会一起消失；那属于读盘失败，不是"包确实缺失"。
+        if not os.path.isdir(os.path.dirname(os.path.abspath(path))):
+            return False, "io_error"
         return False, "missing"
     except OSError:
-        return False, "missing"
+        return False, "io_error"
     if h.hexdigest() != expected_sha256:
         return False, "checksum_mismatch"
     return True, None

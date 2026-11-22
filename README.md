@@ -14,9 +14,16 @@
 - 以总字节最少为原则选整包组合（天数 ≤ 14，子集 DP 精确求解；
   平局取包数更少、id 更小的组合，结果确定）。
 - 只从入选包取数，逐日注明来源包与修订号。
-- 入选包**缺失或 SHA-256 校验失败**→ 剔除该包，按本次已确定的修订**重选**
-  （不重定修订、不回落旧修订）。
+- 入选包**确实缺失或 SHA-256 校验失败**→ 剔除该包并写入目录（status 置为
+  missing/corrupt），按本次已确定的修订**重选**（不重定修订、不回落旧修订）。
+- 入选包**读盘 I/O 错误**（卷暂不可用、EIO、权限等）→ **只影响本次请求**，
+  **不写入目录**；后续请求仍会重新核验该包。
 - 剔除后无任何组合能全覆盖 → **409 整次退回**，不拿旧修订补齐。
+- 读盘错误发生时，把暂不可读的包按"恢复后可读"评估（其余入选包仍须核验通过）：
+  - 若只有按恢复计的包才能补齐全部日期，或能减少最省组合的总字节数 →
+    **503**，响应含 `retry_packages` 与 `Retry-After`，请调用方重试；
+  - 否则照常交付已核验的最省字节组合（200，`retry_packages` 仅作提示）；
+  - 连"所有暂不可读包都恢复"也补不齐 → **409**。
 
 ## 启动（Docker Compose）
 
@@ -44,10 +51,14 @@ DATA_DIR=./data uvicorn app.main:app --reload
 | GET  | `/health` | 健康检查 |
 
 `/backfill` 响应：逐日 `date / revision / feed_kg / source_package_id / source_package_name`，
-入选包清单、`total_bytes`（计费量）、`reselections`（本次被剔除重选的包及原因）。
+入选包清单、`total_bytes`（计费量）、`reselections`（本次被剔除重选的包及原因）、
+`retry_packages`（本次读盘失败、未记入目录的包，正常 200 时可能非空、仅作提示）。
 
 错误：缺日或最高修订异值 → 422（含 `missing_days` / `conflicts` 明细）；
-无法全覆盖 → 409（含 `uncoverable_days` 与被剔除包清单）；区间 > 14 天 → 422。
+无法全覆盖 → 409（含 `uncoverable_days`、被剔除包清单、`unreadable_packages`）；
+暂不可读的包恢复后能补齐或能减少字节 → 503（含 `reason`、`retry_packages`、
+`delivered_total_bytes`、`recovered_total_bytes`，`Retry-After: 5`）；
+区间 > 14 天 → 422。
 
 ## 从 /docs 试跑
 
@@ -85,11 +96,42 @@ docker compose exec web sh -c 'echo tampered > /data/packages/pkg_000004.zip'
 若某日的最高修订只存在于坏包中（如只有 rev2 的包损坏），重选后无人能供应该日
 → 409 整次退回，**不会**回落到 rev1 的旧值。
 
+### 4. 读盘错误与卷恢复
+
+在宿主机上模拟"冷档卷短暂不可读"（让包文件读盘抛 EIO，而不是删除它）：
+
+```bash
+# 用 chattr 不一定可用；更直接的是把包文件改成不可读（EACCES 同样属于 I/O 错误）
+docker compose exec web chmod 000 /data/packages/pkg_000004.zip
+```
+
+再次执行同一 `/backfill`：
+
+- `cheap` 暂不可读。按恢复后可读评估，cheap 能把最省组合从
+  `week1+week2+fix`（3565B）降到 `cheap+week2+fix`（2048B）→ **503**，
+  `detail.reason = "recovery_reduces_bytes"`，`retry_packages` 列出 cheap，
+  带 `Retry-After: 5`。
+- 关键：`GET /packages` 中 cheap 仍是 `registered`——读盘错误**没有**写目录。
+
+卷恢复后再执行：
+
+```bash
+docker compose exec web chmod 644 /data/packages/pkg_000004.zip
+```
+
+`/backfill` 返回 200，选中 `cheap + week2 + fix`，`total_bytes = 2048`，
+11-06/11-07 仍是修订 2——**不会**因为一次读盘失败而回落旧修订，也不会把仍在的
+包记成缺失。
+
+若某日最高修订只在暂不可读的包里，恢复前 → 503
+（`reason = "recovery_required_for_coverage"`）；恢复后 → 200 交付该修订。
+只有当"所有暂不可读包都恢复"也无法按锁定修订补齐时才 → 409。
+
 ## 测试
 
 ```bash
 pip install pytest httpx
-python3 -m pytest tests/ -q     # 14 个用例：交叠选包/坏包重选/409/422/登记校验
+python3 -m pytest tests/ -q     # 22 个用例：交叠选包/坏包重选/读盘错误/卷恢复/409/422/登记校验
 ```
 
 ## 设计说明
@@ -100,4 +142,8 @@ python3 -m pytest tests/ -q     # 14 个用例：交叠选包/坏包重选/409/4
   之后的剔除重选只换包、不换修订，缺了就是 409。
 - **调取信任目录**：取数时只对入选包做"存在 + SHA-256"校验，不重新解析 CSV；
   逐日数值以登记目录为准（登记时已做严格校验）。
-- **坏包状态落库**：missing/corrupt 写入 `packages.status`，后续请求直接跳过。
+- **坏包状态落库**：确实缺失/内容损坏（missing/corrupt）写入 `packages.status`，
+  后续请求直接跳过。
+- **读盘错误不落库**：`io_error` 只在本请求内把包视为不可用；请求结束后不留痕，
+  后续请求仍会核验它。恢复评估也遵守"除假定恢复的包外，其余入选包都必须核验通过"，
+  评估中新发现的读盘错误同样并入恢复假设后重算。
